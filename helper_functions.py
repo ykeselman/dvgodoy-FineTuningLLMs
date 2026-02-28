@@ -1,4 +1,5 @@
 import torch
+from contextlib import nullcontext
 
 def rounding_evolution(lr=3e-3, n_updates=1000, seed=42, decimals=6):
     def round_down(v, decimals):

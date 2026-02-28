@@ -2,9 +2,10 @@ import warnings
 import numpy as np
 import torch
 import datasets
-from datasets import IterableDataset
+from datasets import IterableDataset, Dataset, Value
 from typing import Any, Literal, Optional, Union
-from transformers import DataCollatorForLanguageModeling
+from transformers import AutoModel, AutoTokenizer, DataCollatorForLanguageModeling, PreTrainedModel, PreTrainedTokenizer
+from dataclasses import dataclass
 
 class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
     """
@@ -320,3 +321,187 @@ class ConstantLengthDataset(IterableDataset):
                     "input_ids": torch.LongTensor(example),
                     "labels": torch.LongTensor(example),
                 }
+
+# TODO: Add Abstract Base Class if more formats are added
+@dataclass
+class ChatMlSpecialTokens:
+    """Dataclass for special tokens used in ChatML, including system, user, assistant, bos, eos, and pad tokens."""
+
+    bos_token: str = "<|im_start|>"
+    eos_token: str = "<|im_end|>"
+    pad_token: str = "<|im_end|>"
+
+    @property
+    def system(self):
+        return f"{self.bos_token}system"
+
+    @property
+    def user(self):
+        return f"{self.bos_token}user"
+
+    @property
+    def assistant(self):
+        return f"{self.bos_token}assistant"
+
+    @property
+    def chat_template(self):
+        return (
+            "{% for message in messages %}"
+            f"{{{{'{self.bos_token}' + message['role'] + '\n' + message['content'] + '{self.eos_token}' + '\n'}}}}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            f"{{{{ '{self.assistant}\n' }}}}"
+            "{% endif %}"
+        )
+
+
+FORMAT_MAPPING_CHAT = {"chatml": ChatMlSpecialTokens}
+
+def setup_chat_format(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    format: Literal["chatml"] | None = "chatml",
+    resize_to_multiple_of: int | None = None,
+) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
+    # docstyle-ignore
+    """
+    Setup chat format by adding special tokens to the tokenizer, setting the correct format, and extending the
+    embedding layer of the model based on the new special tokens.
+
+    > [!WARNING]
+    > This function is deprecated and will be removed in version 0.26.0. Please use [`clone_chat_template`] instead.
+
+    If the model already has a chat template, this will throw an error. If you want to overwrite it, please set
+    `tokenizer.chat_template` to `None`.
+
+    Args:
+        model ([`~transformers.PreTrainedModel`]): The model to be modified.
+        tokenizer ([`~transformers.PreTrainedTokenizer`]): The tokenizer to be modified.
+        format (`Literal["chatml"] | None`): The format to be set. Defaults to "chatml".
+        resize_to_multiple_of (`int` or `None`): Number to resize the embedding layer to. Defaults to None.
+
+    Returns:
+        model ([`~transformers.PreTrainedModel`]):
+            The modified model.
+        tokenizer ([`~transformers.PreTrainedTokenizer`]):
+            The modified tokenizer.
+    """
+    warnings.warn(
+        "The `setup_chat_format` function is deprecated and will be removed in version 0.26.0. Please use "
+        "`clone_chat_template` instead.",
+        FutureWarning,
+    )
+    # check if model already had a chat template
+    if tokenizer.chat_template is not None:
+        raise ValueError(
+            "Chat template is already added to the tokenizer. If you want to overwrite it, please set it to None"
+        )
+
+    # check if format available and retrieve
+    if format not in FORMAT_MAPPING_CHAT:
+        raise ValueError(f"Format {format} not available. Please use one of {FORMAT_MAPPING.keys()}")
+
+    chat_format = FORMAT_MAPPING_CHAT[format]()
+
+    # set special tokens and them
+    tokenizer.eos_token = chat_format.eos_token
+    tokenizer.pad_token = chat_format.pad_token
+    tokenizer.bos_token = chat_format.bos_token
+    tokenizer.add_special_tokens({"additional_special_tokens": [chat_format.bos_token, chat_format.eos_token]})
+    # set chat format for tokenizer
+    tokenizer.chat_template = chat_format.chat_template
+
+    # resize embedding layer to a multiple of 64, https://x.com/karpathy/status/1621578354024677377
+    model.resize_token_embeddings(
+        # After studying many tokenizers, we found that len(tokenizer.vocab) is the most reliable way to get the vocab
+        # size. Avoid using tokenizer.vocab_size or tokenizer.vocab_size + len(tokenizer.added_tokens_encoder),
+        # as handling of special and added tokens varies across tokenizers.
+        new_num_tokens=len(tokenizer.vocab),
+        pad_to_multiple_of=resize_to_multiple_of if resize_to_multiple_of is not None else None,
+    )
+    # Update the model config to use the new eos & bos tokens
+    if getattr(model, "config", None) is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.config.bos_token_id = tokenizer.bos_token_id
+        model.config.eos_token_id = tokenizer.eos_token_id
+    # Update the generation config to use the new eos & bos token
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.bos_token_id = tokenizer.bos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+    return model, tokenizer
+
+
+def conversations_formatting_function(
+    tokenizer: AutoTokenizer, messages_field: Literal["messages", "conversations"], tools: list | None = None
+):
+    r"""
+    return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the
+    tokenizer apply chat template to the dataset along with the schema of the list of functions in the tools list.
+
+    <Deprecated version="0.24.0">
+
+    `conversations_formatting_function` is deprecated and will be removed in version 0.27. Please use
+    `tokenizer.apply_chat_template()` directly instead.
+
+    </Deprecated>
+    """
+    warnings.warn(
+        "`conversations_formatting_function` is deprecated and will be removed in TRL 0.27. "
+        "Please use `tokenizer.apply_chat_template()` directly instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+
+    def format_dataset(examples):
+        if isinstance(examples[messages_field][0], list):
+            output_texts = []
+            for i in range(len(examples[messages_field])):
+                output_texts.append(
+                    tokenizer.apply_chat_template(examples[messages_field][i], tokenize=False, tools=tools)
+                )
+            return output_texts
+        else:
+            return tokenizer.apply_chat_template(examples[messages_field], tokenize=False, tools=tools)
+
+    return format_dataset
+
+
+def instructions_formatting_function(tokenizer: AutoTokenizer):
+    r"""
+    return a callable function that takes in an "instructions" dataset and returns a formatted dataset, based on the
+    tokenizer apply chat template to the dataset
+
+    <Deprecated version="0.24.0">
+
+    `instructions_formatting_function` is deprecated and will be removed in version 0.27. Please use
+    `tokenizer.apply_chat_template()` directly instead.
+
+    </Deprecated>
+    """
+    warnings.warn(
+        "`instructions_formatting_function` is deprecated and will be removed in TRL 0.27. "
+        "Please use `tokenizer.apply_chat_template()` directly instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+
+    def format_dataset(examples):
+        if isinstance(examples["prompt"], list):
+            output_texts = []
+            for i in range(len(examples["prompt"])):
+                converted_sample = [
+                    {"role": "user", "content": examples["prompt"][i]},
+                    {"role": "assistant", "content": examples["completion"][i]},
+                ]
+                output_texts.append(tokenizer.apply_chat_template(converted_sample, tokenize=False))
+            return output_texts
+        else:
+            converted_sample = [
+                {"role": "user", "content": examples["prompt"]},
+                {"role": "assistant", "content": examples["completion"]},
+            ]
+            return tokenizer.apply_chat_template(converted_sample, tokenize=False)
+
+    return format_dataset
